@@ -11,7 +11,6 @@
  */
 
 const MARK = /^s=hermes-codex-bridge\r?$/m
-const FLAG = '__gptLiveCodexBridgeInstalled'
 
 const text = value => [{ type: 'input_text', text: String(value ?? '') }]
 
@@ -106,14 +105,44 @@ export function translateOutbound(raw) {
   }
 }
 
+const STATE = '__gptLiveCodexBridge'
+const VERSION = 2
+
+/** A small on-screen note when a bridged call drops unexpectedly, so the cause is not lost. */
+function report(line) {
+  try {
+    console.warn('[gpt-live-codex-bridge] ' + line)
+    globalThis.localStorage?.setItem('gptLiveCodexBridge.lastDrop', new Date().toISOString() + ' ' + line)
+    const box = document.createElement('div')
+    box.textContent = 'GPT-Live bridge: ' + line + ' (click to dismiss)'
+    box.style.cssText =
+      'position:fixed;left:12px;bottom:12px;z-index:2147483647;max-width:70ch;padding:10px 12px;border-radius:8px;' +
+      'background:#1f2430;color:#f2f2f2;font:12px/1.4 ui-monospace,monospace;box-shadow:0 2px 12px rgba(0,0,0,.4);cursor:pointer'
+    box.addEventListener('click', () => box.remove())
+    document.body.appendChild(box)
+    setTimeout(() => box.remove(), 120000)
+  } catch {
+    // Diagnostics must never affect the call.
+  }
+}
+
 function install() {
   const RTC = globalThis.RTCPeerConnection
-  if (!RTC || RTC.prototype[FLAG]) {
+  if (!RTC) {
     return
+  }
+  const previous = globalThis[STATE]
+  if (previous?.version === VERSION) {
+    return
+  }
+  if (previous?.original) {
+    RTC.prototype.createDataChannel = previous.original.createDataChannel
+    RTC.prototype.setRemoteDescription = previous.original.setRemoteDescription
   }
   const bridged = new WeakSet()
   const createDataChannel = RTC.prototype.createDataChannel
   const setRemoteDescription = RTC.prototype.setRemoteDescription
+  globalThis[STATE] = { version: VERSION, original: { createDataChannel, setRemoteDescription } }
 
   RTC.prototype.setRemoteDescription = function (description, ...rest) {
     try {
@@ -137,6 +166,42 @@ function install() {
     const add = channel.addEventListener.bind(channel)
     const remove = channel.removeEventListener.bind(channel)
 
+    // Content-free diagnostics for this call: event type names, counts and connection states only.
+    const diag = { t0: Date.now(), lastIn: '-', lastOut: '-', nIn: 0, nOut: 0, errors: [], states: [], ended: false, reported: false }
+    const age = () => ((Date.now() - diag.t0) / 1000).toFixed(1) + 's'
+    const dropped = why => {
+      if (diag.reported || diag.ended || !bridged.has(peer)) {
+        return
+      }
+      diag.reported = true
+      report(
+        `${why} at ${age()}; peer=${peer.connectionState} ice=${peer.iceConnectionState} channel=${channel.readyState}; ` +
+          `in=${diag.nIn} (last ${diag.lastIn}) out=${diag.nOut} (last ${diag.lastOut}); ` +
+          `states=[${diag.states.slice(-6).join(' ')}]` +
+          (diag.errors.length ? `; errors=[${diag.errors.slice(-3).join(' | ')}]` : '')
+      )
+    }
+    const noteType = raw => {
+      try {
+        const event = JSON.parse(raw)
+        if (event?.type === 'error') {
+          diag.errors.push(`${event.error?.code ?? '?'}: ${String(event.error?.message ?? '').slice(0, 140)}`)
+        }
+        return String(event?.type ?? '?')
+      } catch {
+        return '?'
+      }
+    }
+    peer.addEventListener('connectionstatechange', () => {
+      diag.states.push(`${age()}:${peer.connectionState}`)
+      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+        dropped('peer connection ' + peer.connectionState)
+      }
+    })
+    peer.addEventListener('iceconnectionstatechange', () => diag.states.push(`${age()}:ice-${peer.iceConnectionState}`))
+    add('close', () => dropped('data channel closed'))
+    add('error', event => diag.errors.push('channel error: ' + String(event?.error?.message ?? '').slice(0, 140)))
+
     channel.addEventListener = (type, listener, options) => {
       if (type !== 'message' || typeof listener !== 'function') {
         return add(type, listener, options)
@@ -145,6 +210,8 @@ function install() {
         if (!bridged.has(peer) || typeof event.data !== 'string') {
           return listener(event)
         }
+        diag.nIn += 1
+        diag.lastIn = noteType(event.data)
         for (const data of translateInbound(event.data)) {
           listener(new MessageEvent('message', { data }))
         }
@@ -161,9 +228,12 @@ function install() {
       }
       const out = translateOutbound(data)
       for (const item of out.send) {
+        diag.nOut += 1
+        diag.lastOut = noteType(item)
         send(item)
       }
       if (out.closed) {
+        diag.ended = true
         const closed = JSON.stringify({ type: 'session.closed', reason: 'close_requested' })
         for (const listener of listeners.keys()) {
           try {
@@ -176,7 +246,6 @@ function install() {
     }
     return channel
   }
-  Object.defineProperty(RTC.prototype, FLAG, { value: true })
 }
 
 export default {

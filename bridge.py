@@ -74,6 +74,8 @@ class Call:
         self.thread_id: str | None = None
         self.closed = threading.Event()
         self.started = time.time()
+        self.trace: list[str] = []  # "+seconds method" for the call's lifecycle; no content
+        self.counts: dict[str, int] = {}
 
     def _write(self, message: dict) -> None:
         with self.lock:
@@ -132,7 +134,24 @@ class Call:
         finally:
             self.close("app-server exited")
 
+    def _trace(self, method: str, body: dict) -> None:
+        """Keep a content-free timeline so a dropped call can be diagnosed afterwards."""
+        if method in {"thread/realtime/transcript/delta", "thread/realtime/outputAudio/delta"}:
+            self.counts[method] = self.counts.get(method, 0) + 1
+            self.last_media = time.time()
+            return
+        detail = ""
+        if method == "thread/realtime/itemAdded":
+            detail = f" type={(body.get('item') or {}).get('type')}"
+        elif method == "thread/realtime/closed":
+            detail = f" reason={body.get('reason')}"
+        elif method == "thread/realtime/error":
+            detail = " (message withheld)"
+        if len(self.trace) < 200:
+            self.trace.append(f"+{time.time() - self.started:.1f}s {method}{detail}")
+
     def _note(self, method: str, body: dict) -> None:
+        self._trace(method, body)
         if method == "thread/realtime/started":
             with self.cond:
                 self.session_id = body.get("realtimeSessionId") or self.session_id
@@ -218,6 +237,10 @@ class Call:
         except OSError:
             pass
         CALLS.discard(self)
+        last = getattr(self, "last_media", None)
+        log("call trace:", " | ".join(self.trace[-40:]) or "(none)")
+        log(f"call media: transcript_events={self.counts.get('thread/realtime/transcript/delta', 0)}"
+            f" last_transcript={'+%.1fs' % (last - self.started) if last else 'never'}")
         log(f"call closed after {int(time.time() - self.started)}s: {why}; active={len(CALLS)}")
 
 
