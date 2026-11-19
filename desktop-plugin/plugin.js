@@ -106,7 +106,9 @@ export function translateOutbound(raw) {
 }
 
 const STATE = '__gptLiveCodexBridge'
-const VERSION = 2
+const VERSION = 3
+/** How long a bridged call may sit in WebRTC's recoverable `disconnected` state before the client is told. */
+const GRACE_MS = () => globalThis.__gptLiveCodexBridgeGraceMs ?? 15000
 
 /** A small on-screen note when a bridged call drops unexpectedly, so the cause is not lost. */
 function report(line) {
@@ -126,7 +128,7 @@ function report(line) {
   }
 }
 
-function install() {
+export function install() {
   const RTC = globalThis.RTCPeerConnection
   if (!RTC) {
     return
@@ -138,8 +140,10 @@ function install() {
   if (previous?.original) {
     RTC.prototype.createDataChannel = previous.original.createDataChannel
     RTC.prototype.setRemoteDescription = previous.original.setRemoteDescription
+    delete RTC.prototype.addEventListener
   }
   const bridged = new WeakSet()
+  const peerAdd = EventTarget.prototype.addEventListener
   const createDataChannel = RTC.prototype.createDataChannel
   const setRemoteDescription = RTC.prototype.setRemoteDescription
   globalThis[STATE] = { version: VERSION, original: { createDataChannel, setRemoteDescription } }
@@ -153,6 +157,43 @@ function install() {
       // Never let detection break a call.
     }
     return setRemoteDescription.call(this, description, ...rest)
+  }
+
+  // Hermes' client ends the call the instant the peer reports `disconnected`, a state WebRTC
+  // normally recovers from within seconds. On bridged calls, hold that event back for a grace
+  // period and only deliver it if the connection has not come back. `failed` passes at once.
+  RTC.prototype.addEventListener = function (type, listener, options) {
+    if (type !== 'connectionstatechange' || typeof listener !== 'function') {
+      return peerAdd.call(this, type, listener, options)
+    }
+    const peer = this
+    let timer = null
+    return peerAdd.call(
+      this,
+      type,
+      event => {
+        if (!bridged.has(peer)) {
+          return listener.call(peer, event)
+        }
+        if (peer.connectionState === 'disconnected') {
+          if (timer === null) {
+            timer = setTimeout(() => {
+              timer = null
+              if (peer.connectionState === 'disconnected' || peer.connectionState === 'failed') {
+                listener.call(peer, new Event('connectionstatechange'))
+              }
+            }, GRACE_MS())
+          }
+          return undefined
+        }
+        if (timer !== null) {
+          clearTimeout(timer)
+          timer = null
+        }
+        return listener.call(peer, event)
+      },
+      options
+    )
   }
 
   RTC.prototype.createDataChannel = function (label, ...rest) {
@@ -192,13 +233,16 @@ function install() {
         return '?'
       }
     }
-    peer.addEventListener('connectionstatechange', () => {
+    peerAdd.call(peer, 'connectionstatechange', () => {
       diag.states.push(`${age()}:${peer.connectionState}`)
-      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
-        dropped('peer connection ' + peer.connectionState)
+      if (peer.connectionState === 'disconnected' && bridged.has(peer)) {
+        console.warn(`[gpt-live-codex-bridge] connection blip at ${age()}; holding the call for up to ${GRACE_MS() / 1000}s`)
+      }
+      if (peer.connectionState === 'failed') {
+        dropped('peer connection failed')
       }
     })
-    peer.addEventListener('iceconnectionstatechange', () => diag.states.push(`${age()}:ice-${peer.iceConnectionState}`))
+    peerAdd.call(peer, 'iceconnectionstatechange', () => diag.states.push(`${age()}:ice-${peer.iceConnectionState}`))
     add('close', () => dropped('data channel closed'))
     add('error', event => diag.errors.push('channel error: ' + String(event?.error?.message ?? '').slice(0, 140)))
 

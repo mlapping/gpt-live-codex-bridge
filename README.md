@@ -98,6 +98,9 @@ Subscription voices: arbor, breeze, cove, ember, juniper, maple, sol, spruce, va
 - **Each hand-off also reaches the Codex thread**, which is fenced off (no tools, read-only sandbox,
   instructed to reply `skip`). It still consumes a small amount of subscription usage.
 - **Earlier chat history is passed as quoted background in the prompt**, capped at 6000 characters.
+- **Short network blips are tolerated.** Hermes' client ends a call the moment WebRTC reports
+  `disconnected`; on bridged calls the plugin holds that back for 15 seconds so a recoverable blip
+  does not end the call. If a call does drop, a one-line cause appears at the bottom-left.
 - Mute is handled by the client disabling the microphone track; no mute event is sent upstream.
 - Usage counts against your ChatGPT plan's limits. Check that this use fits the terms of your plan.
 
