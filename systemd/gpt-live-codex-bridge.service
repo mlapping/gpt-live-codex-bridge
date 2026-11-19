@@ -1,0 +1,13 @@
+[Unit]
+Description=GPT-Live -> Codex bridge (native Hermes GPT-Live voice on the ChatGPT subscription)
+After=network.target
+
+[Service]
+# Adjust the path to wherever you cloned the repository.
+ExecStart=/usr/bin/python3 %h/gpt-live-codex-bridge/bridge.py
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

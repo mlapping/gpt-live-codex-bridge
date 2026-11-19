@@ -1,0 +1,6 @@
+{
+  "name": "gpt-live-codex-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node test/translate.test.mjs" }
+}

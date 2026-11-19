@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><title>bridge browser test</title>
+<button id="go">Start test call</button><pre id="out"></pre>
+<script type="module">
+import plugin from '../desktop-plugin/plugin.js'
+plugin.register({})
+const L = (window.__log = []); const t0 = performance.now()
+const log = (...a) => { const s = `[${((performance.now()-t0)/1000).toFixed(1)}s] ` + a.join(' '); L.push(s); out.textContent += s + '\n' }
+window.__done = false
+go.onclick = async () => {
+  try {
+    const ctx = new AudioContext(); await ctx.resume()
+    const buf = await ctx.decodeAudioData(await (await fetch('/test/speech.wav')).arrayBuffer())
+    const src = ctx.createBufferSource(); src.buffer = buf
+    const dest = ctx.createMediaStreamDestination(); src.connect(dest)
+    const pc = new RTCPeerConnection()
+    pc.addEventListener('track', e => { const a = new Audio(); a.srcObject = new MediaStream([e.track]); a.play().catch(()=>{}) })
+    for (const tr of dest.stream.getAudioTracks()) pc.addTrack(tr, dest.stream)
+    const events = pc.createDataChannel('oai-events')
+    let said = '', heard = '', delegated = false
+    // Mirrors Hermes' native client: it only understands Live API event names.
+    events.addEventListener('message', ({ data }) => {
+      const e = JSON.parse(String(data))
+      switch (e.type) {
+        case 'session.started': log('native saw session.started'); break
+        case 'session.input_transcript.delta': heard += e.delta; break
+        case 'session.output_transcript.delta': said += e.delta; break
+        case 'session.delegation.created':
+          if (delegated) break
+          delegated = true
+          log('native saw session.delegation.created id=' + (e.delegation?.id ? 'present' : 'MISSING'), '| heard:', heard.trim())
+          events.send(JSON.stringify({ type: 'session.thinking.append', delegation_id: e.delegation.id, event_id: 'think_1', content: 'Hermes is checking the gateway uptime.' }))
+          setTimeout(() => events.send(JSON.stringify({ type: 'session.commentary.append', delegation_id: e.delegation.id, event_id: 'say_1', content: 'The gateway has been running for six days and four hours.' })), 2500)
+          setTimeout(() => { log('voice said:', said.trim()); events.send(JSON.stringify({ type: 'session.close' })) }, 14000)
+          break
+        case 'error': log('native saw ERROR', JSON.stringify(e.error).slice(0, 200)); break
+        case 'session.closed': log('native saw session.closed reason=' + e.reason); pc.close(); window.__done = true; break
+      }
+    })
+    await pc.setLocalDescription(await pc.createOffer())
+    await new Promise(r => { if (pc.iceGatheringState === 'complete') r(); else pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && r()); setTimeout(r, 4000) })
+    const res = await (await fetch('/test/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sdp: pc.localDescription.sdp, history: [] }) })).json()
+    if (!res.ok) throw new Error('session failed: ' + JSON.stringify(res).slice(0, 200))
+    log('answer received; marker present:', /^s=hermes-codex-bridge\r?$/m.test(res.transport.sdp))
+    await pc.setRemoteDescription({ sdp: res.transport.sdp, type: 'answer' })
+    src.start()
+    setTimeout(() => { if (!window.__done) { log('TIMEOUT; heard:', heard.trim(), '| said:', said.trim()); window.__done = true } }, 60000)
+  } catch (err) { log('FAILED', String(err)); window.__done = true }
+}
+</script>
